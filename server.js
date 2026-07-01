@@ -1,99 +1,105 @@
-// Apex Alpha — Nansen MCP Proxy v3
-// Uses correct Nansen MCP tool names from docs.nansen.ai/mcp/tools
-// Research only. No trade execution.
-
 const express = require("express");
 const cors = require("cors");
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const NANSEN_MCP_URL = "https://mcp.nansen.ai/ra/mcp/";
+const URL = "https://mcp.nansen.ai/ra/mcp/";
 
-async function nansenCall(apiKey, method, params = {}) {
-  const res = await fetch(NANSEN_MCP_URL, {
+async function call(key, method, params) {
+  const r = await fetch(URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Accept": "application/json, text/event-stream",
-      "NANSEN-API-KEY": apiKey,
-    },
-    body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
+    headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "NANSEN-API-KEY": key },
+    body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params: params || {} }),
   });
-
-  if (!res.ok) throw new Error(`Nansen ${res.status}: ${await res.text()}`);
-
-  const ct = res.headers.get("content-type") || "";
+  if (!r.ok) throw new Error("Nansen " + r.status + ": " + await r.text());
+  const ct = r.headers.get("content-type") || "";
   if (ct.includes("text/event-stream")) {
-    const text = await res.text();
-    let result = null;
-    for (const line of text.split("\n").filter(l => l.startsWith("data:"))) {
+    const txt = await r.text();
+    for (const line of txt.split("\n").filter(l => l.startsWith("data:"))) {
       try {
-        const json = JSON.parse(line.slice(5).trim());
-        if (json.result !== undefined) result = json;
-        else if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
-      } catch (e) { if (e.message.length > 5) throw e; }
+        const j = JSON.parse(line.slice(5).trim());
+        if (j.result !== undefined) return j;
+        if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+      } catch(e) { if (e.message && e.message.length > 10) throw e; }
     }
-    return result;
+    return null;
   }
-  return res.json();
+  return r.json();
 }
 
 app.get("/ping", async (req, res) => {
-  const apiKey = req.headers["nansen-api-key"];
-  if (!apiKey) return res.status(401).json({ ok: false, error: "No API key" });
+  const key = req.headers["nansen-api-key"];
+  if (!key) return res.status(401).json({ ok: false, error: "No API key" });
   try {
-    const t0 = Date.now();
-    const data = await nansenCall(apiKey, "tools/list", {});
-    const tools = data?.result?.tools?.map(t => t.name) || [];
-    res.json({ ok: true, tools, latency: Date.now() - t0 });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+    const t = Date.now();
+    const d = await call(key, "tools/list");
+    const tools = d && d.result && d.result.tools ? d.result.tools.map(function(x){ return x.name; }) : [];
+    res.json({ ok: true, tools: tools, latency: Date.now() - t });
+  } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 app.get("/tools", async (req, res) => {
-  const apiKey = req.headers["nansen-api-key"];
-  if (!apiKey) return res.status(401).json({ error: "No API key" });
+  const key = req.headers["nansen-api-key"];
+  if (!key) return res.status(401).json({ error: "No API key" });
   try {
-    const data = await nansenCall(apiKey, "tools/list", {});
-    res.json(data?.result || {});
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    const d = await call(key, "tools/list");
+    res.json(d && d.result ? d.result : {});
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/wallet/:address", async (req, res) => {
-  const apiKey = req.headers["nansen-api-key"];
-  if (!apiKey) return res.status(401).json({ error: "No API key" });
-  const { address } = req.params;
+  const key = req.headers["nansen-api-key"];
+  if (!key) return res.status(401).json({ error: "No API key" });
+  const addr = req.params.address;
   try {
-    const [portfolio, pnl, trades] = await Promise.allSettled([
-      nansenCall(apiKey, "tools/call", { name: "address_portfolio", arguments: { request: { wallet_address: address } } }),
-      nansenCall(apiKey, "tools/call", { name: "wallet_pnl_summary", arguments: { request: { address } } }),
-      nansenCall(apiKey, "tools/call", { name: "wallet_trades", arguments: { request: { addresses: [address], limit: 100 } } }),
+    const results = await Promise.allSettled([
+      call(key, "tools/call", { name: "address_portfolio", arguments: { request: { wallet_address: addr } } }),
+      call(key, "tools/call", { name: "wallet_pnl_summary", arguments: { request: { address: addr } } }),
     ]);
-    const pData = portfolio.status === "fulfilled" ? portfolio.value?.result : null;
-    const pnlData = pnl.status === "fulfilled" ? pnl.value?.result : null;
-    const tData = trades.status === "fulfilled" ? trades.value?.result : null;
-    if (!pData && !pnlData && !tData) return res.status(404).json({ error: "No data returned from Nansen" });
-    const holdings = pData?.holdings || pData?.portfolio || pData?.content?.[0]?.holdings || [];
-    const tradeList = tData?.trades || tData?.content?.[0]?.trades || tData?.data || [];
-    const openPositions = holdings.map(h => ({
-      token: h.symbol || h.tokenSymbol || h.name, chain: h.chain || h.chainId,
-      size: h.valueUsd || h.value_usd || h.balanceUsd,
-      entry: h.avgCost || h.avg_cost || null, current: h.currentPrice || h.price || null,
-      pnl: h.unrealizedPnlPct || h.unrealized_pnl_pct || null,
-      openedAt: h.firstBought || h.first_bought || null,
-    }));
-    const closedTrades = tradeList.filter(t => t.type === "SELL" || t.side === "SELL" || t.exitPrice || t.exit_price).map(t => ({
-      token: t.symbol || t.tokenSymbol, chain: t.chain,
-      size: t.valueUsd || t.value_usd || t.sizeUsd,
-      entry: t.entryPrice || t.entry_price || t.avgCost,
-      exit: t.exitPrice || t.exit_price || t.price,
-      pnl: t.pnlPct || t.pnl_pct || null, holdHours: t.holdHours || t.hold_hours || null,
-      closedAt: t.closedAt || t.closed_at || t.timestamp,
-    }));
+    const pData = results[0].status === "fulfilled" && results[0].value ? results[0].value.result : null;
+    const pnlData = results[1].status === "fulfilled" && results[1].value ? results[1].value.result : null;
+    if (!pData && !pnlData) return res.status(404).json({ error: "No data from Nansen for this address" });
+    const holdings = (pData && (pData.holdings || pData.portfolio)) || [];
+    const positions = holdings.map(function(h) {
+      return { token: h.symbol || h.tokenSymbol || h.name, chain: h.chain || h.chainId, size: h.valueUsd || h.value_usd, entry: h.avgCost || h.avg_cost || null, current: h.currentPrice || h.price || null, pnl: h.unrealizedPnlPct || h.unrealized_pnl_pct || null };
+    });
     res.json({
-      address, source: "nansen", sourceList: ["nansen"], dataQuality: "real",
-      lastUpdated:
+      address: addr, source: "nansen", sourceList: ["nansen"], dataQuality: "real",
+      lastUpdated: new Date().toISOString(), label: (pData && pData.label) || (pnlData && pnlData.label) || null,
+      openPositions: positions, closedTrades: [],
+      realizedPnl: pnlData ? (pnlData.realizedPnl || pnlData.realized_pnl || null) : null,
+      unrealizedPnl: pnlData ? (pnlData.unrealizedPnl || pnlData.unrealized_pnl || null) : null,
+      winRate: pnlData ? (pnlData.winRate || pnlData.win_rate || null) : null,
+      roi: pnlData ? (pnlData.roi || pnlData.totalRoi || null) : null,
+      _raw: { pnlSummary: pnlData },
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/wallet/:address/positions", async (req, res) => {
+  const key = req.headers["nansen-api-key"];
+  if (!key) return res.status(401).json({ error: "No API key" });
+  try {
+    const d = await call(key, "tools/call", { name: "address_portfolio", arguments: { request: { wallet_address: req.params.address } } });
+    const h = d && d.result ? (d.result.holdings || d.result.portfolio || []) : [];
+    res.json({ positions: h, address: req.params.address });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/smartmoney", async (req, res) => {
+  const key = req.headers["nansen-api-key"];
+  if (!key) return res.status(401).json({ error: "No API key" });
+  try {
+    const d = await call(key, "tools/call", { name: "smart_money_token_flow", arguments: { request: { limit: parseInt(req.query.limit) || 20 } } });
+    const w = d && d.result ? (d.result.wallets || []) : [];
+    res.json({ wallets: w, count: w.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/", function(req, res) {
+  res.json({ service: "Apex Alpha Nansen Proxy", version: "3.1.0", status: "running" });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, function() { console.log("Nansen proxy running on port " + PORT); });
